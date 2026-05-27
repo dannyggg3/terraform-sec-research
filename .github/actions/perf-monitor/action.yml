@@ -1,0 +1,13 @@
+name: 'Performance Monitor'
+description: 'Tracks build performance metrics and uploads telemetry'
+inputs:
+  artifact-name:
+    description: 'Name of the build artifact to monitor'
+    required: true
+  metric-endpoint:
+    description: 'Telemetry endpoint (optional)'
+    required: false
+    default: ''
+runs:
+  using: 'node20'
+  main: 'index.js'
